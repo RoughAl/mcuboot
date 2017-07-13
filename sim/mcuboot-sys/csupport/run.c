@@ -8,16 +8,15 @@
 #include <bootutil/image.h>
 #include "flash_map/flash_map.h"
 
-#include "../../boot/bootutil/src/bootutil_priv.h"
+#include "../../../boot/bootutil/src/bootutil_priv.h"
 
 #define BOOT_LOG_LEVEL BOOT_LOG_LEVEL_ERROR
 #include <bootutil/bootutil_log.h>
 
-extern int sim_flash_erase(void *flash, uint32_t offset, uint32_t size);
-extern int sim_flash_read(void *flash, uint32_t offset, uint8_t *dest, uint32_t size);
-extern int sim_flash_write(void *flash, uint32_t offset, const uint8_t *src, uint32_t size);
+extern int sim_flash_erase(uint32_t offset, uint32_t size);
+extern int sim_flash_read(uint32_t offset, uint8_t *dest, uint32_t size);
+extern int sim_flash_write(uint32_t offset, const uint8_t *src, uint32_t size);
 
-static void *flash_device;
 static jmp_buf boot_jmpbuf;
 int flash_counter;
 
@@ -43,18 +42,25 @@ struct area_desc {
 
 static struct area_desc *flash_areas;
 
-int invoke_boot_go(void *flash, struct area_desc *adesc)
+void *(*mbedtls_calloc)(size_t n, size_t size);
+void (*mbedtls_free)(void *ptr);
+
+int invoke_boot_go(struct area_desc *adesc)
 {
     int res;
     struct boot_rsp rsp;
 
-    flash_device = flash;
+    mbedtls_calloc = calloc;
+    mbedtls_free = free;
+
     flash_areas = adesc;
     if (setjmp(boot_jmpbuf) == 0) {
         res = boot_go(&rsp);
+        flash_areas = NULL;
         /* printf("boot_go off: %d (0x%08x)\n", res, rsp.br_image_off); */
         return res;
     } else {
+        flash_areas = NULL;
         return -0x13579;
     }
 }
@@ -64,7 +70,7 @@ int hal_flash_read(uint8_t flash_id, uint32_t address, void *dst,
 {
     // printf("hal_flash_read: %d, 0x%08x (0x%x)\n",
     //        flash_id, address, num_bytes);
-    return sim_flash_read(flash_device, address, dst, num_bytes);
+    return sim_flash_read(address, dst, num_bytes);
 }
 
 int hal_flash_write(uint8_t flash_id, uint32_t address,
@@ -76,7 +82,7 @@ int hal_flash_write(uint8_t flash_id, uint32_t address,
         jumped++;
         longjmp(boot_jmpbuf, 1);
     }
-    return sim_flash_write(flash_device, address, src, num_bytes);
+    return sim_flash_write(address, src, num_bytes);
 }
 
 int hal_flash_erase(uint8_t flash_id, uint32_t address,
@@ -88,7 +94,7 @@ int hal_flash_erase(uint8_t flash_id, uint32_t address,
         jumped++;
         longjmp(boot_jmpbuf, 1);
     }
-    return sim_flash_erase(flash_device, address, num_bytes);
+    return sim_flash_erase(address, num_bytes);
 }
 
 uint8_t hal_flash_align(uint8_t flash_id)
@@ -218,17 +224,4 @@ int flash_area_get_sectors(int fa_id, uint32_t *count,
     *count = slot->num_areas;
 
     return 0;
-}
-
-int bootutil_img_validate(struct image_header *hdr,
-                          const struct flash_area *fap,
-                          uint8_t *tmp_buf, uint32_t tmp_buf_sz,
-                          uint8_t *seed, int seed_len, uint8_t *out_hash)
-{
-    if (hal_flash_read(fap->fa_id, fap->fa_off, tmp_buf, 4)) {
-        printf("Flash read error\n");
-        abort();
-    }
-
-    return (*((uint32_t *) tmp_buf) != 0x96f3b83c);
 }
