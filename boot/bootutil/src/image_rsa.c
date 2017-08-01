@@ -19,8 +19,8 @@
 
 #include <string.h>
 
-#ifdef APP_mynewt
-#include "mynewt/config.h"
+#ifdef MCUBOOT_MYNEWT
+#include "mcuboot_config/mcuboot_config.h"
 #endif
 
 #ifdef MCUBOOT_SIGN_RSA
@@ -263,7 +263,7 @@ bootutil_cmp_rsasig(mbedtls_rsa_context *ctx, uint8_t *hash, uint32_t hlen,
 
     return 0;
 }
-#else /* BOOTUTIL_RSA_PKCS1_15 */
+#else /* MCUBOOT_RSA_PKCS1_15 */
 /*
  * PKCS1.5 using RSA2048 computed over SHA256.
  */

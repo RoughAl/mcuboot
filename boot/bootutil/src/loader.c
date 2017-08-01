@@ -24,6 +24,7 @@
 
 #include <assert.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,8 +37,8 @@
 #define BOOT_LOG_LEVEL BOOT_LOG_LEVEL_INFO
 #include "bootutil/bootutil_log.h"
 
-#ifdef APP_mynewt
-#include "mynewt/config.h"
+#ifdef MCUBOOT_MYNEWT
+#include "mcuboot_config/mcuboot_config.h"
 #endif
 
 static struct boot_loader_state boot_data;
@@ -125,21 +126,6 @@ static const struct boot_status_table boot_status_tables[] = {
 #define BOOT_STATUS_TABLES_COUNT \
     (sizeof boot_status_tables / sizeof boot_status_tables[0])
 
-/**
- * This table indicates the next swap type that should be performed.  The first
- * column contains the current swap type.  The second column contains the swap
- * type that should be effected after the first completes.
- */
-static const uint8_t boot_swap_trans_table[][2] = {
-    /*     From                     To             */
-    { BOOT_SWAP_TYPE_REVERT,    BOOT_SWAP_TYPE_NONE },
-    { BOOT_SWAP_TYPE_PERM,      BOOT_SWAP_TYPE_NONE },
-    { BOOT_SWAP_TYPE_TEST,      BOOT_SWAP_TYPE_REVERT },
-};
-
-#define BOOT_SWAP_TRANS_TABLE_SIZE   \
-    (sizeof boot_swap_trans_table / sizeof boot_swap_trans_table[0])
-
 #define BOOT_LOG_SWAP_STATE(area, state)                            \
     BOOT_LOG_INF("%s: magic=%s, copy_done=0x%x, image_ok=0x%x",     \
                  (area),                                            \
@@ -200,27 +186,27 @@ boot_status_source(void)
 
 /**
  * Calculates the type of swap that just completed.
+ *
+ * This is used when a swap is interrupted by an external event. After
+ * finishing the swap operation determines what the initial request was.
  */
 static int
 boot_previous_swap_type(void)
 {
     int post_swap_type;
-    int i;
 
     post_swap_type = boot_swap_type();
 
-    for (i = 0; i < BOOT_SWAP_TRANS_TABLE_SIZE; i++){
-        if (boot_swap_trans_table[i][1] == post_swap_type) {
-            return boot_swap_trans_table[i][0];
-        }
+    switch (post_swap_type) {
+    case BOOT_SWAP_TYPE_NONE   : return BOOT_SWAP_TYPE_PERM;
+    case BOOT_SWAP_TYPE_REVERT : return BOOT_SWAP_TYPE_TEST;
+    case BOOT_SWAP_TYPE_PANIC  : return BOOT_SWAP_TYPE_PANIC;
     }
 
-    /* XXX: Temporary assert. */
-    assert(0);
-
-    return BOOT_SWAP_TYPE_REVERT;
+    return BOOT_SWAP_TYPE_FAIL;
 }
 
+#ifndef MCUBOOT_OVERWRITE_ONLY
 static int
 boot_read_header_from_scratch(struct image_header *out_hdr)
 {
@@ -240,6 +226,7 @@ boot_read_header_from_scratch(struct image_header *out_hdr)
     flash_area_close(fap);
     return rc;
 }
+#endif /* !MCUBOOT_OVERWRITE_ONLY */
 
 static int
 boot_read_image_header(int slot, struct image_header *out_hdr)
@@ -604,18 +591,16 @@ static int
 boot_validated_swap_type(void)
 {
     int swap_type;
-    int rc;
 
     swap_type = boot_swap_type();
-    if (swap_type == BOOT_SWAP_TYPE_NONE) {
-        /* Continue using slot 0. */
-        return BOOT_SWAP_TYPE_NONE;
-    }
-
-    /* Boot loader wants to switch to slot 1.  Ensure image is valid. */
-    rc = boot_validate_slot(1);
-    if (rc != 0) {
-        return BOOT_SWAP_TYPE_FAIL;
+    switch (swap_type) {
+    case BOOT_SWAP_TYPE_TEST:
+    case BOOT_SWAP_TYPE_PERM:
+    case BOOT_SWAP_TYPE_REVERT:
+        /* Boot loader wants to switch to slot 1. Ensure image is valid. */
+        if (boot_validate_slot(1) != 0) {
+            swap_type = BOOT_SWAP_TYPE_FAIL;
+        }
     }
 
     return swap_type;
@@ -800,6 +785,7 @@ boot_status_init_by_id(int flash_area_id)
     return 0;
 }
 
+#ifndef MCUBOOT_OVERWRITE_ONLY
 static int
 boot_erase_last_sector_by_id(int flash_area_id)
 {
@@ -826,6 +812,7 @@ boot_erase_last_sector_by_id(int flash_area_id)
 
     return rc;
 }
+#endif /* !MCUBOOT_OVERWRITE_ONLY */
 
 /**
  * Swaps the contents of two flash regions within the two image slots.
@@ -1094,10 +1081,10 @@ boot_copy_image(struct boot_status *bs)
 #endif
 
 /**
- * Marks a test image in slot 0 as fully copied.
+ * Marks the image in slot 0 as fully copied.
  */
 static int
-boot_finalize_test_swap(void)
+boot_set_copy_done(void)
 {
     const struct flash_area *fap;
     int rc;
@@ -1108,23 +1095,24 @@ boot_finalize_test_swap(void)
     }
 
     rc = boot_write_copy_done(fap);
-    if (rc != 0) {
-        return rc;
-    }
-
-    return 0;
+    flash_area_close(fap);
+    return rc;
 }
 
 /**
  * Marks a reverted image in slot 0 as confirmed.  This is necessary to ensure
  * the status bytes from the image revert operation don't get processed on a
  * subsequent boot.
+ *
+ * NOTE: image_ok is tested before writing because if there's a valid permanent
+ * image installed on slot0 and the new image to be upgrade to has a bad sig,
+ * image_ok would be overwritten.
  */
 static int
-boot_finalize_revert_swap(void)
+boot_set_image_ok(void)
 {
     const struct flash_area *fap;
-    struct boot_swap_state state_slot0;
+    struct boot_swap_state state;
     int rc;
 
     rc = flash_area_open(FLASH_AREA_IMAGE_0, &fap);
@@ -1132,33 +1120,19 @@ boot_finalize_revert_swap(void)
         return BOOT_EFLASH;
     }
 
-    rc = boot_read_swap_state(fap, &state_slot0);
+    rc = boot_read_swap_state(fap, &state);
     if (rc != 0) {
-        return BOOT_EFLASH;
+        rc = BOOT_EFLASH;
+        goto out;
     }
 
-    if (state_slot0.magic == BOOT_MAGIC_UNSET) {
-        rc = boot_write_magic(fap);
-        if (rc != 0) {
-            return rc;
-        }
-    }
-
-    if (state_slot0.copy_done == BOOT_FLAG_UNSET) {
-        rc = boot_write_copy_done(fap);
-        if (rc != 0) {
-            return rc;
-        }
-    }
-
-    if (state_slot0.image_ok == BOOT_FLAG_UNSET) {
+    if (state.image_ok == BOOT_FLAG_UNSET) {
         rc = boot_write_image_ok(fap);
-        if (rc != 0) {
-            return rc;
-        }
     }
 
-    return 0;
+out:
+    flash_area_close(fap);
+    return rc;
 }
 
 /**
@@ -1189,6 +1163,12 @@ boot_swap_if_needed(int *out_swap_type)
     if (bs.idx != 0 || bs.state != 0) {
         rc = boot_copy_image(&bs);
         assert(rc == 0);
+
+        /* NOTE: here we have finished a swap resume. The initial request
+         * was either a TEST or PERM swap, which now after the completed
+         * swap will be determined to be respectively REVERT (was TEST)
+         * or NONE (was PERM).
+         */
 
         /* Extrapolate the type of the partial swap.  We need this
          * information to know how to mark the swap complete in flash.
@@ -1225,6 +1205,7 @@ boot_go(struct boot_rsp *rsp)
     size_t slot;
     int rc;
     int fa_id;
+    bool reload_headers = false;
 
     /* The array of slot sectors are defined here (as opposed to file scope) so
      * that they don't get allocated for non-boot-loader apps.  This is
@@ -1267,32 +1248,35 @@ boot_go(struct boot_rsp *rsp)
         if (rc != 0) {
             goto out;
         }
+
+        /*
+         * The following states need image_ok be explicitly set after the
+         * swap was finished to avoid a new revert.
+         */
+        if (swap_type == BOOT_SWAP_TYPE_REVERT || swap_type == BOOT_SWAP_TYPE_FAIL) {
+            rc = boot_set_image_ok();
+            if (rc != 0) {
+                swap_type = BOOT_SWAP_TYPE_PANIC;
+            }
+        }
     } else {
         swap_type = BOOT_SWAP_TYPE_NONE;
     }
 
     switch (swap_type) {
     case BOOT_SWAP_TYPE_NONE:
-#ifdef MCUBOOT_VALIDATE_SLOT0
-        rc = boot_validate_slot(0);
-        assert(rc == 0);
-        if (rc != 0) {
-            rc = BOOT_EBADIMAGE;
-            goto out;
-        }
-#endif
         slot = 0;
         break;
 
-    case BOOT_SWAP_TYPE_TEST:
-    case BOOT_SWAP_TYPE_PERM:
-        slot = 1;
-        boot_finalize_test_swap();
-        break;
-
+    case BOOT_SWAP_TYPE_TEST:          /* fallthrough */
+    case BOOT_SWAP_TYPE_PERM:          /* fallthrough */
     case BOOT_SWAP_TYPE_REVERT:
         slot = 1;
-        boot_finalize_revert_swap();
+        reload_headers = true;
+        rc = boot_set_copy_done();
+        if (rc != 0) {
+            swap_type = BOOT_SWAP_TYPE_PANIC;
+        }
         break;
 
     case BOOT_SWAP_TYPE_FAIL:
@@ -1301,14 +1285,38 @@ boot_go(struct boot_rsp *rsp)
          * we just reverted back to slot 0.
          */
         slot = 0;
-        boot_finalize_revert_swap();
+        reload_headers = true;
         break;
 
     default:
-        assert(0);
-        slot = 0;
-        break;
+        swap_type = BOOT_SWAP_TYPE_PANIC;
     }
+
+    if (swap_type == BOOT_SWAP_TYPE_PANIC) {
+        BOOT_LOG_ERR("panic!");
+        assert(0);
+
+        /* Loop forever... */
+        while (1) {}
+    }
+
+#ifdef MCUBOOT_VALIDATE_SLOT0
+    if (reload_headers) {
+            rc = boot_read_image_headers();
+            if (rc != 0) {
+                    goto out;
+            }
+    }
+
+    rc = boot_validate_slot(0);
+    assert(rc == 0);
+    if (rc != 0) {
+        rc = BOOT_EBADIMAGE;
+        goto out;
+    }
+#else
+    (void)reload_headers;
+#endif
 
     /* Always boot from the primary slot. */
     rsp->br_flash_dev_id = boot_img_fa_device_id(&boot_data, 0);

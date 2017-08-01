@@ -21,10 +21,10 @@
 
 *** SUMMARY
 
-The Mynewt bootloader comprises two packages:
+mcuboot comprises two packages:
 
     * The bootutil library (boot/bootutil)
-    * The boot application (apps/boot)
+    * The boot application (each port has its own at boot/<port>)
 
 The bootutil library performs most of the functions of a boot loader.  In
 particular, the piece that is missing is the final step of actually jumping to
@@ -103,7 +103,7 @@ case of changes to the format of the image header.
 
 *** FLASH MAP
 
-A Mynewt device's flash is partitioned according to its _flash map_.  At a high
+A device's flash is partitioned according to its _flash map_.  At a high
 level, the flash map maps numeric IDs to _flash areas_.  A flash area is a
 region of disk with the following properties:
     (1) An area can be fully erased without affecting any other areas.
@@ -200,25 +200,26 @@ can be in:
     Revert to image 1 on next reboot |
     ---------------------------------'
 
-*** BOOT VECTOR
+*** IMAGE TRAILER
 
-At startup, the boot loader determines which of the above three states the
-device is in by inspecting the boot vector.  The boot vector consists of two
-records (called "image trailers"), one written at the end of each image slot.
+For the bootloader to be able to determine the current state and what actions
+should be taken during the current boot operation, it uses metadata existing
+on both slots, and while doing a swap operation it can be located in scratch.
+This metadata is located at the end of the slot and is called image trailer.
 An image trailer has the following structure:
 
      0                   1                   2                   3
      0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    ~                       MAGIC (16 octets)                       ~
-    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     ~                                                               ~
     ~             Swap status (128 * min-write-size * 3)            ~
     ~                                                               ~
     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    |   Copy done   |     0xff padding (up to min-write-sz - 1)     ~
+    |   Copy done   |           0xff padding (7 octets)             |
     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    |   Image OK    |     0xff padding (up to min-write-sz - 1)     ~
+    |   Image OK    |           0xff padding (7 octets)             |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                       MAGIC (16 octets)                       |
     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
 These records are at the end of each image slot.  The offset immediately
@@ -231,7 +232,19 @@ then min-write-size is 2, and so on.
 
 The fields are defined as follows:
 
-1. MAGIC: The following 16 bytes, written in host-byte-order:
+1. Swap status: A series of single-byte records.  Each record corresponds to a
+flash sector in an image slot.  A swap status byte indicate the location of
+the corresponding sector data.  During an image swap, image data is moved one
+sector at a time.  The swap status is necessary for resuming a swap operation
+if the device rebooted before a swap operation completed.
+
+2. Copy done: A single byte indicating whether the image in this slot is
+complete (0x01=done; 0xff=not done).
+
+3. Image OK: A single byte indicating whether the image in this slot has been
+confirmed as good by the user (0x01=confirmed; 0xff=not confirmed).
+
+4. MAGIC: The following 16 bytes, written in host-byte-order:
 
     const uint32_t boot_img_magic[4] = {
         0xf395c277,
@@ -240,71 +253,60 @@ The fields are defined as follows:
         0x8079b62c,
     };
 
-2. Swap status: A series of single-byte records.  Each record corresponds to a
-flash sector in an image slot.  A swap status byte indicate the location of
-the corresponding sector data.  During an image swap, image data is moved one
-sector at a time.  The swap status is necessary for resuming a swap operation
-if the device rebooted before a swap operation completed.
+*** IMAGE TRAILERS
 
-3. Copy done: A single byte indicating whether the image in this slot is
-complete (0x01=done; 0xff=not done).
+At startup, the boot loader determines which of the above four states the
+device is in by inspecting the image trailers.  When using the term "image
+trailers" what is meant is the aggregate information provided by both image
+slot's trailers.
 
-4. Image OK: A single byte indicating whether the image in this slot has been
-confirmed as good by the user (0x01=confirmed; 0xff=not confirmed).
-
-The boot vector records are structured around the limitations imposed by flash
+The image trailers records are structured around the limitations imposed by flash
 hardware.  As a consequence, they do not have a very intuitive design, and it
 is difficult to get a sense of the state of the device just by looking at the
-boot vector.  It is better to map all the possible vector states to the three
+image trailers.  It is better to map all the possible trailer states to the four
 states described above via a set of tables.  These tables are reproduced below.
 In these tables, the "pending" and "confirmed" flags are shown for illustrative
-purposes; they are not actually present in the boot vector.
+purposes; they are not actually present in the image trailers.
+
+Note: An important caveat about the tables described below is that they must
+be evaluated in the order presented here. Lower state numbers must have a
+higher priority when testing the image trailers.
 
 
     State I
                      | slot-0 | slot-1 |
     -----------------+--------+--------|
-               magic | Unset  | Unset  |
-            image-ok | Any    | Any    |
-    -----------------+--------+--------'
-             pending |        |        |
-          confirmed  |   X    |        |
-    -----------------+--------+--------'
-     swap: none                        |
-    -----------------------------------'
-    
-
-    State II
-                     | slot-0 | slot-1 |
-    -----------------+--------+--------|
                magic | Any    | Good   |
             image-ok | Any    | Unset  |
+           copy-done | Any    | Any    |
     -----------------+--------+--------'
              pending |        |   T    |
           confirmed  |   X    |        |
     -----------------+--------+--------'
      swap: test                        |
     -----------------------------------'
-    
 
-    State III
+
+    State II
                      | slot-0 | slot-1 |
     -----------------+--------+--------|
                magic | Any    | Good   |
             image-ok | Any    | 0x01   |
+           copy-done | Any    | Any    |
     -----------------+--------+--------'
              pending |        |   P    |
           confirmed  |   X    |        |
     -----------------+--------+--------'
      swap: permanent                   |
     -----------------------------------'
-    
 
-    State IV
+
+    State III
                      | slot-0 | slot-1 |
     -----------------+--------+--------|
                magic | Good   | Unset  |
             image-ok | 0xff   | Any    |
+           copy-done | 0x01   | Any    |
     -----------------+--------+--------'
              pending |        |        |
           confirmed  |        |   X    |
@@ -313,17 +315,38 @@ purposes; they are not actually present in the boot vector.
     -----------------------------------'
 
 
-    State V
+Those three states described above are explicity tested for and result in a
+swap decision by the bootloader. If the existing values in the the image trailers
+are not one of those previously described the bootloader will assume no swap
+operation is to be performed which is illustrated by state IV.
+
+
+    State IV
                      | slot-0 | slot-1 |
     -----------------+--------+--------|
-               magic | Good   | Unset  |
-            image-ok | 0x01   | Any    |
+               magic | Any    | Any    |
+            image-ok | Any    | Any    |
+           copy-done | Any    | Any    |
     -----------------+--------+--------'
              pending |        |        |
           confirmed  |   X    |        |
     -----------------+--------+--------'
-     swap: none (confirmed test image) |
+     swap: none                        |
     -----------------------------------'
+
+
+Note: An important caveat to be mentioned here is, that due to the physical
+limitations of the storage and another possible failure, two extra "states"
+were added specifically to signal a failure in the boot process.
+
+1. One of them is a result of any device read/write error, called panic and
+   will result in the bootloader hanging without booting the image in slot 0.
+
+2. Another state was added specifically to handle the situation in which a swap
+   was requested and the image in slot 1 fails to validate, due to hashing
+   or signing error. This state behaves as state IV with the extra action of
+   marking the image in slot 0 as confirmed.
+
 
 *** HIGH-LEVEL OPERATION
 
@@ -333,26 +356,24 @@ sections describe each step of the process in more detail.
 
 Procedure:
 
-A. Inspect swap status region; is an interrupted swap is being resumed?
+A. Inspect swap status region; is an interrupted swap being resumed?
     Yes: Complete the partial swap operation; skip to step C.
     No: Proceed to step B.
 
-B. Insect boot vector; is a swap requested?
+B. Inspect image trailers; is a swap requested?
     Yes.
         1. Is the requested image valid (integrity and security check)?
             Yes.
                 a. Perform swap operation.
-                b. Persist completion of swap procedure to boot vector.
+                b. Persist completion of swap procedure to image trailers.
                 c. Proceed to step C.
             No.
                 a. Erase invalid image.
-                b. Persist failure of swap procedure to boot vector.
+                b. Persist failure of swap procedure to image trailers.
                 c. Proceed to step C.
     No: Proceed to step C.
 
 C. Boot into image in slot 0.
-
-
 
 *** IMAGE SWAPPING
 
@@ -363,7 +384,7 @@ The boot loader swaps the contents of the two image slots for two reasons:
     * Test image rebooted without being confirmed; the boot loader should
       revert to the original image currently in slot-1 (state IV).
 
-If the boot vector indicates that the image in the secondary slot should be
+If the image trailers indicates that the image in the secondary slot should be
 run, the boot loader needs to copy it to the primary slot.  The image currently
 in the primary slot also needs to be retained in flash so that it can be used
 later.  Furthermore, both images need to be recoverable if the boot loader
@@ -376,6 +397,9 @@ according to the following procedure:
        with the greatest index); current element = "index".
         b. Erase scratch area.
         c. Copy slot0[index] to scratch area.
+            - If these are the last sectors (i.e., first swap being perfomed),
+              copy the full sector *except* the image trailer.
+            - Else, copy entire sector contents.
         d. Write updated swap status (i).
 
         e. Erase slot1[index]
@@ -387,6 +411,9 @@ according to the following procedure:
 
         h. Erase slot0[index].
         i. Copy scratch area slot0[index].
+            - If these are the last sectors (i.e., first swap being perfomed),
+              copy the full sector *except* the image trailer.
+            - Else, copy entire sector contents.
         j. Write updated swap status (iii).
 
     3. Persist completion of swap procedure to slot 0 image trailer.
@@ -396,27 +423,41 @@ trailer can be written by the user at a later time.  With the image trailer
 unwritten, the user can test the image in slot 1 (i.e., transition to state
 II).
 
+Note1: If the sector being copied is the last sector, then swap status is
+temporarily maintained on scratch for the duration of this operation, always
+using slot0's area otherwise.
+
+Note2: The bootloader tries to copy only used sectors (based on largest image
+installed on any of the slots), minimizing the amount of sectors copied and
+reducing the amount of time required for a swap operation.
+
 The particulars of step 3 vary depending on whether an image is being tested,
-permanently used, or reverted:
+permanently used, reverted or a validation failure of slot 1 happened when a
+swap was requested:
+
     * test:
         o Write slot0.copy_done = 1
         (swap caused the following values to be written:
             slot0.magic = BOOT_MAGIC
             slot0.image_ok = Unset)
-        (should now be in state IV)
 
     * permanent:
         o Write slot0.copy_done = 1
         (swap caused the following values to be written:
             slot0.magic = BOOT_MAGIC
             slot0.image_ok = 0x01)
-        (should now be in state V)
 
     * revert:
-        o Write slot0.magic = BOOT_MAGIC
         o Write slot0.copy_done = 1
         o Write slot0.image_ok = 1
-        (should now be in state V)
+        (swap caused the following values to be written:
+            slot0.magic = BOOT_MAGIC)
+
+    * failure to validate slot 1:
+        o Write slot0.image_ok = 1
+
+After completing the operations as described above the image in slot 0 should
+be booted.
 
 *** SWAP STATUS
 
@@ -490,16 +531,18 @@ record that gets written will be somewhere in the middle of the region.  For
 example, if a slot uses 64 sectors, the first sector index that gets swapped is
 63, which corresponds to the exact halfway point within the region.
 
+Note: since the scratch area only ever needs to record swapping of the last
+sector, it uses at most min-write-size * 3 bytes for its own status area.
 
 *** RESET RECOVERY
 
 If the boot loader resets in the middle of a swap operation, the two images may
 be discontiguous in flash.  Bootutil recovers from this condition by using the
-boot vector to determine how the image parts are distributed in flash.
+image trailers to determine how the image parts are distributed in flash.
 
 The first step is determine where the relevant swap status region is located.
 Because this region is embedded within the image slots, its location in flash
-changes during a swap operation.  The below set of tables map boot vector
+changes during a swap operation.  The below set of tables map image trailers
 contents to swap status location.  In these tables, the "source" field
 indicates where the swap status region is located.
 
@@ -532,11 +575,13 @@ indicates where the swap status region is located.
         magic | Unset      | Any        |
     copy-done | 0xff       | N/A        |
     ----------+------------+------------|
-    source: varies                      |
+    source: slot 0                      |
     ------------------------------------+------------------------------+
     This represents one of two cases:                                  |
     o No swaps ever (no status to read, so no harm in checking).       |
     o Mid-revert; status in slot 0.                                    |
+    For this reason we assume slot 0 as source, to trigger a check     |
+    of the status area and find out if there was swapping under way.   |
     -------------------------------------------------------------------'
 
 
@@ -555,14 +600,15 @@ it had just been started.
 *** INTEGRITY CHECK
 
 An image is checked for integrity immediately before it gets copied into the
-primary slot.  If the boot loader doesn't perform an image swap, then it
-doesn't perform an integrity check.
+primary slot.  If the boot loader doesn't perform an image swap, then it can
+perform an optional integrity check of the image in slot0 if
+MCUBOOT_VALIDATE_SLOT0 is set, otherwise it doesn't perform an integrity check.
 
 During the integrity check, the boot loader verifies the following aspects of
 an image:
     * 32-bit magic number must be correct (0x96f3b83c).
     * Image must contain a SHA256 TLV.
-    * Calculated SHA256 must matche SHA256 TLV contents.
+    * Calculated SHA256 must match SHA256 TLV contents.
     * Image *may* contain a signature TLV.  If it does, its contents must be
       verifiable using a key embedded in the boot loader.
 
@@ -577,4 +623,4 @@ with.  The boot loader uses this index to identify the corresponding public
 key.
 
 For information on embedding public keys in the boot loader, as well as
-producing signed images, see: boot/bootutil/signed_images.md
+producing signed images, see: doc/signed_images.md
