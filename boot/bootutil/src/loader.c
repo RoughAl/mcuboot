@@ -206,23 +206,40 @@ boot_previous_swap_type(void)
     return BOOT_SWAP_TYPE_FAIL;
 }
 
+/*
+ * Compute the total size of the given image.  Includes the size of
+ * the TLVs.
+ */
 #ifndef MCUBOOT_OVERWRITE_ONLY
 static int
-boot_read_header_from_scratch(struct image_header *out_hdr)
+boot_read_image_size(int slot, struct image_header *hdr, uint32_t *size)
 {
     const struct flash_area *fap;
+    struct image_tlv_info info;
+    int area_id;
     int rc;
 
-    rc = flash_area_open(FLASH_AREA_IMAGE_SCRATCH, &fap);
-    if (rc != 0) {
-        return BOOT_EFLASH;
-    }
-
-    rc = flash_area_read(fap, 0, out_hdr, sizeof *out_hdr);
+    area_id = flash_area_id_from_image_slot(slot);
+    rc = flash_area_open(area_id, &fap);
     if (rc != 0) {
         rc = BOOT_EFLASH;
+        goto done;
     }
 
+    rc = flash_area_read(fap, hdr->ih_hdr_size + hdr->ih_img_size,
+                         &info, sizeof(info));
+    if (rc != 0) {
+        rc = BOOT_EFLASH;
+        goto done;
+    }
+    if (info.it_magic != IMAGE_TLV_INFO_MAGIC) {
+        rc = BOOT_EBADIMAGE;
+        goto done;
+    }
+    *size = hdr->ih_hdr_size + hdr->ih_img_size + info.it_tlv_tot;
+    rc = 0;
+
+done:
     flash_area_close(fap);
     return rc;
 }
@@ -440,7 +457,10 @@ boot_read_status(struct boot_status *bs)
         return BOOT_EFLASH;
     }
 
-    return boot_read_status_bytes(fap, bs);
+    rc = boot_read_status_bytes(fap, bs);
+
+    flash_area_close(fap);
+    return rc;
 }
 
 /**
@@ -760,7 +780,7 @@ done:
 }
 
 static inline int
-boot_status_init_by_id(int flash_area_id)
+boot_status_init_by_id(int flash_area_id, const struct boot_status *bs)
 {
     const struct flash_area *fap;
     struct boot_swap_state swap_state;
@@ -776,6 +796,9 @@ boot_status_init_by_id(int flash_area_id)
         rc = boot_write_image_ok(fap);
         assert(rc == 0);
     }
+
+    rc = boot_write_swap_size(fap, bs->swap_size);
+    assert(rc == 0);
 
     rc = boot_write_magic(fap);
     assert(rc == 0);
@@ -870,7 +893,7 @@ boot_swap_sectors(int idx, uint32_t sz, struct boot_status *bs)
 
         if (bs->idx == 0) {
             if (bs->use_scratch) {
-                boot_status_init_by_id(FLASH_AREA_IMAGE_SCRATCH);
+                boot_status_init_by_id(FLASH_AREA_IMAGE_SCRATCH, bs);
             } else {
                 /* Prepare the status area... here it is known that the
                  * last sector is not being used by the image data so it's
@@ -879,7 +902,7 @@ boot_swap_sectors(int idx, uint32_t sz, struct boot_status *bs)
                 rc = boot_erase_last_sector_by_id(FLASH_AREA_IMAGE_0);
                 assert(rc == 0);
 
-                boot_status_init_by_id(FLASH_AREA_IMAGE_0);
+                boot_status_init_by_id(FLASH_AREA_IMAGE_0, bs);
             }
         }
 
@@ -945,6 +968,9 @@ boot_swap_sectors(int idx, uint32_t sz, struct boot_status *bs)
                 assert(rc == 0);
             }
 
+            rc = boot_write_swap_size(fap, bs->swap_size);
+            assert(rc == 0);
+
             rc = boot_write_magic(fap);
             assert(rc == 0);
 
@@ -996,8 +1022,7 @@ boot_copy_image(struct boot_status *bs)
         size += this_size;
     }
 
-    BOOT_LOG_INF("Copying slot 1 to slot 0: 0x%x bytes",
-                 size);
+    BOOT_LOG_INF("Copying slot 1 to slot 0: 0x%lx bytes", size);
     rc = boot_copy_sector(FLASH_AREA_IMAGE_1, FLASH_AREA_IMAGE_0,
                           0, 0, size);
 
@@ -1020,39 +1045,43 @@ boot_copy_image(struct boot_status *bs)
     struct image_header *hdr;
     uint32_t size;
     uint32_t copy_size;
-    struct image_header tmp_hdr;
     int rc;
 
     /* FIXME: just do this if asked by user? */
 
     size = copy_size = 0;
 
-    hdr = boot_img_hdr(&boot_data, 0);
-    if (hdr->ih_magic == IMAGE_MAGIC) {
-        copy_size = hdr->ih_hdr_size + hdr->ih_img_size + hdr->ih_tlv_size;
-    }
+    if (bs->idx == 0 && bs->state == 0) {
+        /*
+         * No swap ever happened, so need to find the largest image which
+         * will be used to determine the amount of sectors to swap.
+         */
+        hdr = boot_img_hdr(&boot_data, 0);
+        if (hdr->ih_magic == IMAGE_MAGIC) {
+            rc = boot_read_image_size(0, hdr, &copy_size);
+            assert(rc == 0);
+        }
 
-    hdr = boot_img_hdr(&boot_data, 1);
-    if (hdr->ih_magic == IMAGE_MAGIC) {
-        size = hdr->ih_hdr_size + hdr->ih_img_size + hdr->ih_tlv_size;
-    }
+        hdr = boot_img_hdr(&boot_data, 1);
+        if (hdr->ih_magic == IMAGE_MAGIC) {
+            rc = boot_read_image_size(1, hdr, &size);
+            assert(rc == 0);
+        }
 
-    if (!size || !copy_size || size == copy_size) {
-        rc = boot_read_header_from_scratch(&tmp_hdr);
+        if (size > copy_size) {
+            copy_size = size;
+        }
+
+        bs->swap_size = copy_size;
+    } else {
+        /*
+         * If a swap was under way, the swap_size should already be present
+         * in the trailer...
+         */
+        rc = boot_read_swap_size(&bs->swap_size);
         assert(rc == 0);
 
-        hdr = &tmp_hdr;
-        if (hdr->ih_magic == IMAGE_MAGIC) {
-            if (!size) {
-                size = hdr->ih_hdr_size + hdr->ih_img_size + hdr->ih_tlv_size;
-            } else {
-                copy_size = hdr->ih_hdr_size + hdr->ih_img_size + hdr->ih_tlv_size;
-            }
-        }
-    }
-
-    if (size > copy_size) {
-        copy_size = size;
+        copy_size = bs->swap_size;
     }
 
     size = 0;
@@ -1083,6 +1112,7 @@ boot_copy_image(struct boot_status *bs)
 /**
  * Marks the image in slot 0 as fully copied.
  */
+#ifndef MCUBOOT_OVERWRITE_ONLY
 static int
 boot_set_copy_done(void)
 {
@@ -1098,6 +1128,7 @@ boot_set_copy_done(void)
     flash_area_close(fap);
     return rc;
 }
+#endif /* !MCUBOOT_OVERWRITE_ONLY */
 
 /**
  * Marks a reverted image in slot 0 as confirmed.  This is necessary to ensure
@@ -1108,6 +1139,7 @@ boot_set_copy_done(void)
  * image installed on slot0 and the new image to be upgrade to has a bad sig,
  * image_ok would be overwritten.
  */
+#ifndef MCUBOOT_OVERWRITE_ONLY
 static int
 boot_set_image_ok(void)
 {
@@ -1134,6 +1166,7 @@ out:
     flash_area_close(fap);
     return rc;
 }
+#endif /* !MCUBOOT_OVERWRITE_ONLY */
 
 /**
  * Performs an image swap if one is required.
@@ -1254,10 +1287,12 @@ boot_go(struct boot_rsp *rsp)
          * swap was finished to avoid a new revert.
          */
         if (swap_type == BOOT_SWAP_TYPE_REVERT || swap_type == BOOT_SWAP_TYPE_FAIL) {
+#ifndef MCUBOOT_OVERWRITE_ONLY
             rc = boot_set_image_ok();
             if (rc != 0) {
                 swap_type = BOOT_SWAP_TYPE_PANIC;
             }
+#endif /* !MCUBOOT_OVERWRITE_ONLY */
         }
     } else {
         swap_type = BOOT_SWAP_TYPE_NONE;
@@ -1273,10 +1308,12 @@ boot_go(struct boot_rsp *rsp)
     case BOOT_SWAP_TYPE_REVERT:
         slot = 1;
         reload_headers = true;
+#ifndef MCUBOOT_OVERWRITE_ONLY
         rc = boot_set_copy_done();
         if (rc != 0) {
             swap_type = BOOT_SWAP_TYPE_PANIC;
         }
+#endif /* !MCUBOOT_OVERWRITE_ONLY */
         break;
 
     case BOOT_SWAP_TYPE_FAIL:
@@ -1302,10 +1339,16 @@ boot_go(struct boot_rsp *rsp)
 
 #ifdef MCUBOOT_VALIDATE_SLOT0
     if (reload_headers) {
-            rc = boot_read_image_headers();
-            if (rc != 0) {
-                    goto out;
-            }
+        rc = boot_read_image_headers();
+        if (rc != 0) {
+            goto out;
+        }
+        /* Since headers were reloaded, it can be assumed we just performed a
+         * swap or overwrite. Now the header info that should be used to
+         * provide the data for the bootstrap, which previously was at Slot 1,
+         * was updated to Slot 0.
+         */
+        slot = 0;
     }
 
     rc = boot_validate_slot(0);

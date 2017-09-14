@@ -39,5 +39,5 @@ pkg.deps:
     - "@apache-mynewt-core/sys/defs"
     - "@apache-mynewt-core/sys/flash_map"
 
-pkg.deps.BOOTUTIL_SIGN_EC256:
-    - "@apache-mynewt-core/crypto/tinycrypt"
+pkg.deps.BOOTUTIL_USE_TINYCRYPT:
+    - "@mcuboot/boot/mynewt/tinycrypt"

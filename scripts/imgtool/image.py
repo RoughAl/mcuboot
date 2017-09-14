@@ -6,25 +6,23 @@ from . import version as versmod
 import hashlib
 import struct
 
-IMAGE_MAGIC = 0x96f3b83c
+IMAGE_MAGIC = 0x96f3b83d
 IMAGE_HEADER_SIZE = 32
 
 # Image header flags.
 IMAGE_F = {
         'PIC':                   0x0000001,
-        'SHA256':                0x0000002,
-        'PKCS15_RSA2048_SHA256': 0x0000004,
-        'ECDSA224_SHA256':       0x0000008,
-        'NON_BOOTABLE':          0x0000010,
-        'ECDSA256_SHA256':       0x0000020,
-        'PKCS1_PSS_RSA2048_SHA256': 0x0000040, }
+        'NON_BOOTABLE':          0x0000010, }
 
 TLV_VALUES = {
-        'SHA256': 1,
-        'RSA2048': 2,
-        'ECDSA224': 3,
-        'ECDSA256': 4, }
+        'KEYHASH': 0x01,
+        'SHA256': 0x10,
+        'RSA2048': 0x20,
+        'ECDSA224': 0x21,
+        'ECDSA256': 0x22, }
 
+TLV_INFO_SIZE = 4
+TLV_INFO_MAGIC = 0x6907
 TLV_HEADER_SIZE = 4
 
 # Sizes of the image trailer, depending on flash write size.
@@ -50,7 +48,8 @@ class TLV():
         self.buf += payload
 
     def get(self):
-        return bytes(self.buf)
+        header = struct.pack('<HH', TLV_INFO_MAGIC, TLV_INFO_SIZE + len(self.buf))
+        return header + bytes(self.buf)
 
 class Image():
     @classmethod
@@ -106,6 +105,12 @@ class Image():
         tlv.add('SHA256', digest)
 
         if key is not None:
+            pub = key.get_public_bytes()
+            sha = hashlib.sha256()
+            sha.update(pub)
+            pubbytes = sha.digest()
+            tlv.add('KEYHASH', pubbytes)
+
             sig = key.sign(self.payload)
             tlv.add(key.sig_tlv(), sig)
 
@@ -120,10 +125,9 @@ class Image():
         flags = 0
         tlvsz = 0
         if key is not None:
-            flags |= IMAGE_F[key.sig_type()]
             tlvsz += TLV_HEADER_SIZE + key.sig_len()
 
-        flags |= IMAGE_F['SHA256']
+        tlvsz += 4 + hashlib.sha256().digest_size
         tlvsz += 4 + hashlib.sha256().digest_size
 
         fmt = ('<' +

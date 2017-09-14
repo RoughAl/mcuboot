@@ -13,30 +13,19 @@ use pem;
 use ring::{digest, rand, signature};
 use untrusted;
 
-bitflags! {
-    struct Flags: u32 {
-        const FLAG_PIC = 0x000001;
-        const FLAG_SHA256 = 0x000002;
-        const FLAG_PKCS15_RSA2048_SHA256 = 0x000004;
-        const FLAG_ECDSA224_SHA256 = 0x000008;
-        const FLAG_NON_BOOTABLE = 0x000010;
-        const FLAG_ECDSA256_SHA256 = 0x000020;
-        const FLAG_PKCS1_PSS_RSA2048_SHA256 = 0x000040;
-    }
-}
-
 #[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // TODO: For now
 pub enum TlvKinds {
-    SHA256 = 1,
-    RSA2048 = 2,
-    ECDSA224 = 3,
-    ECDSA256 = 4,
+    KEYHASH = 0x01,
+    SHA256 = 0x10,
+    RSA2048 = 0x20,
+    ECDSA224 = 0x21,
+    ECDSA256 = 0x22,
 }
 
 pub struct TlvGen {
-    flags: Flags,
+    flags: u32,
     kinds: Vec<TlvKinds>,
     size: u16,
     payload: Vec<u8>,
@@ -47,7 +36,7 @@ impl TlvGen {
     #[allow(dead_code)]
     pub fn new_hash_only() -> TlvGen {
         TlvGen {
-            flags: FLAG_SHA256,
+            flags: 0,
             kinds: vec![TlvKinds::SHA256],
             size: 4 + 32,
             payload: vec![],
@@ -57,8 +46,8 @@ impl TlvGen {
     #[allow(dead_code)]
     pub fn new_rsa_pss() -> TlvGen {
         TlvGen {
-            flags: FLAG_SHA256 | FLAG_PKCS1_PSS_RSA2048_SHA256,
-            kinds: vec![TlvKinds::SHA256, TlvKinds::RSA2048],
+            flags: 0,
+            kinds: vec![TlvKinds::SHA256, TlvKinds::KEYHASH, TlvKinds::RSA2048],
             size: 4 + 32 + 4 + 256,
             payload: vec![],
         }
@@ -66,12 +55,12 @@ impl TlvGen {
 
     /// Retrieve the header flags for this configuration.  This can be called at any time.
     pub fn get_flags(&self) -> u32 {
-        self.flags.bits()
+        self.flags
     }
 
     /// Retrieve the size that the TLV will occupy.  This can be called at any time.
     pub fn get_size(&self) -> u16 {
-        self.size
+        4 + self.size
     }
 
     /// Add bytes to the covered hash.
@@ -82,6 +71,12 @@ impl TlvGen {
     /// Compute the TLV given the specified block of data.
     pub fn make_tlv(self) -> Vec<u8> {
         let mut result: Vec<u8> = vec![];
+
+        let size = self.get_size();
+        result.push(0x07);
+        result.push(0x69);
+        result.push((size & 0xFF) as u8);
+        result.push(((size >> 8) & 0xFF) as u8);
 
         if self.kinds.contains(&TlvKinds::SHA256) {
             let hash = digest::digest(&digest::SHA256, &self.payload);
@@ -96,6 +91,17 @@ impl TlvGen {
         }
 
         if self.kinds.contains(&TlvKinds::RSA2048) {
+            // Output the hash of the public key.
+            let hash = digest::digest(&digest::SHA256, RSA_PUB_KEY);
+            let hash = hash.as_ref();
+
+            assert!(hash.len() == 32);
+            result.push(TlvKinds::KEYHASH as u8);
+            result.push(0);
+            result.push(32);
+            result.push(0);
+            result.extend_from_slice(hash);
+
             // For now assume PSS.
             let key_bytes = pem::parse(include_bytes!("../../root-rsa-2048.pem").as_ref()).unwrap();
             assert_eq!(key_bytes.tag, "RSA PRIVATE KEY");
@@ -117,3 +123,5 @@ impl TlvGen {
         result
     }
 }
+
+include!("rsa_pub_key-rs.txt");
